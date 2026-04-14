@@ -13,6 +13,7 @@
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 :root{
@@ -225,6 +226,10 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--w);
   color:#fff;border:none;border-radius:10px;padding:8px 14px;
   font-family:inherit;font-size:13px;font-weight:600;cursor:pointer}
 .sheet-btn:active{filter:brightness(.9)}
+.xl-btn{display:flex;align-items:center;gap:5px;background:#1D6F42;
+  color:#fff;border:none;border-radius:10px;padding:8px 14px;
+  font-family:inherit;font-size:13px;font-weight:600;cursor:pointer}
+.xl-btn:active{filter:brightness(.9)}
 .empty{text-align:center;padding:64px 20px;color:var(--g)}
 .clist{padding:8px 12px;display:flex;flex-direction:column;gap:8px}
 .crd{background:var(--bg2);border:1px solid var(--brd);border-radius:14px;overflow:hidden;
@@ -481,7 +486,10 @@ input[type=file]{display:none}
 <div class="screen" id="screen-list">
   <div class="list-top">
     <div class="list-cnt">저장 <b id="lCnt">0</b>장</div>
-    <button class="sheet-btn" id="openSheetBtn" onclick="openSheet()">📊 시트 열기</button>
+    <div style="display:flex;gap:6px">
+      <button class="xl-btn" onclick="downloadExcel()">📥 엑셀</button>
+      <button class="sheet-btn" id="openSheetBtn" onclick="openSheet()">📊 시트</button>
+    </div>
   </div>
   <div class="queue-banner" id="queueBanner">
     ⏳ <span id="queueTxt">오프라인 저장 데이터 0건 — 연결 시 자동 전송</span>
@@ -816,31 +824,90 @@ function handleImg(file){
   reader.readAsDataURL(file);
 }
 
-// ── AI ───────────────────────────────────────────────────
+// ── OCR (Tesseract.js) ───────────────────────────────────
 async function runAI(file, dataUrl){
   try{
-    const base64=dataUrl.split(',')[1];
-    const mime=(file&&file.type)||'image/jpeg';
-    const res=await fetch('https://api.anthropic.com/v1/messages',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:600,
-        messages:[{role:'user',content:[
-          {type:'image',source:{type:'base64',media_type:mime,data:base64}},
-          {type:'text',text:'명함에서 JSON만 출력:\n{"company":"","company_conf":"high","name":"","name_conf":"high","title":"","title_conf":"mid","email":"","email_conf":"high","phone":"","phone_conf":"mid","mobile":"","mobile_conf":"mid"}'}
-        ]}]})
+    document.getElementById('aiTxt').textContent = 'OCR 분석 중... (첫 실행 시 언어팩 다운로드로 30초 소요)';
+    const worker = await Tesseract.createWorker(['kor','eng'],1,{
+      logger: m => {
+        if(m.status==='recognizing text'){
+          const pct = Math.round((m.progress||0)*100);
+          document.getElementById('aiTxt').textContent = `OCR 인식 중... ${pct}%`;
+        }
+      }
     });
-    const data=await res.json();
-    const txt=data.content?.[0]?.text||'{}';
-    let ex={};
-    try{ const m=txt.match(/\{[\s\S]*\}/); if(m) ex=JSON.parse(m[0]); }catch(e){}
+    const { data: { text } } = await worker.recognize(dataUrl);
+    await worker.terminate();
+
+    const ex = parseCard(text);
     S.aiData=ex; S.aiDone=true;
     showAiBar('done');
     if(document.getElementById('screen-verify').classList.contains('on')) fillForm(ex);
-    showToast('✨ AI 추출 완료');
+    showToast('✨ OCR 추출 완료');
   }catch(err){
+    console.error('[OCR]', err);
     S.aiDone=true; S.aiData={};
     showAiBar('fail');
+    showToast('⚠️ OCR 실패 — 직접 입력해 주세요');
   }
+}
+
+// ── 명함 텍스트 파싱 ─────────────────────────────────────
+function parseCard(raw){
+  const lines = raw.split('\n').map(l=>l.trim()).filter(l=>l.length>1);
+  const text  = lines.join(' ');
+
+  // 이메일
+  const emailM = text.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
+  const email  = emailM ? emailM[0].toLowerCase() : '';
+
+  // 전화번호 (숫자+구분자 8자리 이상)
+  const telAll = [...text.matchAll(/(\+?[\d][\d\s\-\.\(\)]{6,}[\d])/g)]
+    .map(m=>m[0].replace(/\s/g,'').trim())
+    .filter(p=>p.replace(/\D/g,'').length>=7);
+  const phone  = telAll[0]||'';
+  const mobile = telAll[1]||'';
+
+  // 회사명 — (주), Co., Ltd, Inc 포함 줄 우선
+  let company='';
+  const coRe = /주식회사|㈜|\(주\)|co[,.]?\s*ltd|inc\.?|corp\.?|llc|gmbh|co\.\s/i;
+  for(const l of lines){ if(coRe.test(l)&&l.length<60){ company=l.replace(/^[\s\W]+/,''); break; } }
+  // 없으면 가장 긴 줄(이메일·전화 제외)
+  if(!company){
+    const cand = lines
+      .filter(l=>!l.includes('@')&&!/^[\d\s\-\+\(\)]+$/.test(l)&&l.length>2&&l.length<60)
+      .sort((a,b)=>b.length-a.length);
+    company = cand[0]||'';
+  }
+
+  // 이름 — 한글 2-4자 한 줄, 또는 영문 이름(대문자 시작 단어 2개)
+  let name='';
+  for(const l of lines){
+    if(/^[가-힣]{2,4}$/.test(l)){ name=l; break; }
+  }
+  if(!name){
+    for(const l of lines){
+      if(/^[A-Z][a-z]+ [A-Z][a-z]+$/.test(l)){ name=l; break; }
+    }
+  }
+
+  // 직함 — 직책 키워드 포함 줄
+  const ttlKw = ['대표','이사','부장','과장','팀장','차장','사원','주임','매니저','선임','책임',
+                 'CEO','CFO','CTO','COO','Director','Manager','President','VP','Senior','Engineer'];
+  let title='';
+  for(const l of lines){
+    if(ttlKw.some(k=>l.includes(k))){ title=l; break; }
+  }
+
+  const conf = v => v?'mid':'low';
+  return {
+    company, company_conf: company?'mid':'low',
+    name,    name_conf:    conf(name),
+    title,   title_conf:   conf(title),
+    email,   email_conf:   email?'high':'low',
+    phone,   phone_conf:   conf(phone),
+    mobile,  mobile_conf:  conf(mobile),
+  };
 }
 
 function showAiBar(state){
@@ -1157,6 +1224,30 @@ function applyModal(){
 function saveSet(k,v){ if(k==='sales'){S.sales=v;localStorage.setItem('bl5_sales',v);} }
 function clearAll(){ if(!confirm('로컬 데이터를 전체 삭제할까요? (구글 시트 데이터는 유지됩니다)')) return; S.cards=[]; S.queue=[]; localStorage.removeItem('bl5_cards'); localStorage.removeItem('bl5_queue'); renderList(); showToast('🗑️ 삭제됨'); }
 
+// ── 엑셀 다운로드 ────────────────────────────────────────
+function downloadExcel(){
+  if(!S.cards.length){ showToast('저장된 명함이 없습니다'); return; }
+  const headers = ['No.','전시회명','국가','수집일자','회사명','성명','직함',
+    '이메일','전화','휴대폰','담당사원','★등급','잠재력점수','팔로업',
+    'D+7 알림일','D+30 알림일','메모','저장시각','동기화'];
+  const rows = S.cards.map((c,i) => [
+    i+1, c.expo||'', c.country||'', c.date||'',
+    c.company||'', c.name||'', c.title||'',
+    c.email||'', c.phone||'', c.mobile||'',
+    c.salesperson||c.sales||'', c.grade||'B', c.score||65,
+    c.followup||'미완료', c.d7||'', c.d30||'',
+    c.memo||'', c.savedAt||'', c.synced?'완료':'미완료'
+  ]);
+  const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+  // 헤더 열 너비 자동 조정
+  ws['!cols'] = headers.map((_,i) => ({wch: [6,20,8,12,22,14,16,28,16,16,10,6,8,8,14,14,30,18,8][i]||12}));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, '명함 DB');
+  const today = new Date().toISOString().split('T')[0];
+  XLSX.writeFile(wb, `BioLight_명함_${today}.xlsx`);
+  showToast(`📥 ${S.cards.length}건 엑셀 저장 완료!`);
+}
+
 // ── 토스트 ───────────────────────────────────────────────
 function showToast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('on'); setTimeout(()=>t.classList.remove('on'),2600); }
 
@@ -1191,7 +1282,6 @@ document.querySelector('.topbar').addEventListener('click', e=>{
 #ios-install-banner .ib-arrow{text-align:center;margin-top:10px;font-size:12px;color:#888}
 #ios-install-banner .ib-arrow b{color:#3B82F6}
 </style>
-
 <div id="ios-install-banner">
   <div class="ib-row">
     <div class="ib-icon">BL</div>
@@ -1207,7 +1297,6 @@ document.querySelector('.topbar').addEventListener('click', e=>{
 <!-- ── Service Worker 등록 ── -->
 <script>
 (function(){
-  // Service Worker 등록
   if('serviceWorker' in navigator){
     window.addEventListener('load', ()=>{
       navigator.serviceWorker.register('./sw.js')
@@ -1215,29 +1304,16 @@ document.querySelector('.topbar').addEventListener('click', e=>{
         .catch(err=>console.warn('[BioLight] SW 등록 실패:', err));
     });
   }
-
-  // iOS 홈 화면 추가 안내 배너
-  function isIos(){
-    return /iphone|ipad|ipod/i.test(navigator.userAgent);
+  function isIos(){ return /iphone|ipad|ipod/i.test(navigator.userAgent); }
+  function isStandalone(){ return navigator.standalone===true||window.matchMedia('(display-mode: standalone)').matches; }
+  const dismissed = localStorage.getItem('bl_install_dismissed');
+  const oneDayAgo = new Date(Date.now()-24*60*60*1000);
+  if(isIos()&&!isStandalone()&&(!dismissed||new Date(dismissed)<oneDayAgo)){
+    setTimeout(()=>{ document.getElementById('ios-install-banner').style.display='block'; }, 3000);
   }
-  function isInStandaloneMode(){
-    return navigator.standalone === true ||
-           window.matchMedia('(display-mode: standalone)').matches;
-  }
-
-  const bannerDismissed = localStorage.getItem('bl_install_dismissed');
-  const bannerDismissedDate = bannerDismissed ? new Date(bannerDismissed) : null;
-  const oneDayAgo = new Date(Date.now() - 24*60*60*1000);
-
-  if(isIos() && !isInStandaloneMode() && (!bannerDismissedDate || bannerDismissedDate < oneDayAgo)){
-    setTimeout(()=>{
-      document.getElementById('ios-install-banner').style.display = 'block';
-    }, 3000);
-  }
-
-  window.dismissInstallBanner = function(){
-    document.getElementById('ios-install-banner').style.display = 'none';
-    localStorage.setItem('bl_install_dismissed', new Date().toISOString());
+  window.dismissInstallBanner=function(){
+    document.getElementById('ios-install-banner').style.display='none';
+    localStorage.setItem('bl_install_dismissed',new Date().toISOString());
   };
 })();
 </script>
