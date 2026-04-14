@@ -13,7 +13,6 @@
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 :root{
@@ -503,6 +502,30 @@ input[type=file]{display:none}
 <div class="screen" id="screen-settings">
 <div class="set-screen">
 
+  <!-- Claude API 키 -->
+  <div class="set-sec" id="api-section">
+    <div class="set-ttl">Claude AI 설정</div>
+    <div class="gs-box">
+      <div class="gs-status-row">
+        <div class="gs-icon">🤖</div>
+        <div class="gs-info">
+          <div class="gs-info-title">Claude API 키</div>
+          <div class="gs-info-sub" id="apiInfoSub">명함 AI 자동 인식에 사용됩니다</div>
+        </div>
+        <div class="gs-status-chip" id="apiChip">미입력</div>
+      </div>
+      <div class="gs-url-row">
+        <input class="gs-url-inp" id="apiKeyInp" type="password"
+          placeholder="sk-ant-api03-...  API 키 붙여넣기"
+          oninput="previewApiKey()">
+        <button class="gs-save-btn" onclick="saveApiKey()">저장</button>
+      </div>
+      <div style="padding:10px 14px;font-size:11px;color:var(--g);line-height:1.6">
+        💡 console.anthropic.com → API Keys에서 발급 · 명함 1장당 약 $0.001
+      </div>
+    </div>
+  </div>
+
   <!-- Google Sheets 연동 -->
   <div class="set-sec" id="gs-section">
     <div class="set-ttl">Google Sheets 연동</div>
@@ -755,6 +778,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   updateSyncStatus();
   renderList();
   updateQueueUI();
+  updateApiStatus();
 
   if(S.gsUrl){
     document.getElementById('gsUrl').value = S.gsUrl;
@@ -824,90 +848,53 @@ function handleImg(file){
   reader.readAsDataURL(file);
 }
 
-// ── OCR (Tesseract.js) ───────────────────────────────────
+// ── AI (Claude API) ──────────────────────────────────────
 async function runAI(file, dataUrl){
+  const apiKey = localStorage.getItem('bl5_apiKey')||'';
+  if(!apiKey){
+    S.aiDone=true; S.aiData={};
+    showAiBar('fail');
+    showToast('⚙️ 설정에서 Claude API 키를 먼저 입력해주세요');
+    goTab('settings');
+    setTimeout(()=>document.getElementById('api-section').scrollIntoView({behavior:'smooth'}),200);
+    return;
+  }
   try{
-    document.getElementById('aiTxt').textContent = 'OCR 분석 중... (첫 실행 시 언어팩 다운로드로 30초 소요)';
-    const worker = await Tesseract.createWorker(['kor','eng'],1,{
-      logger: m => {
-        if(m.status==='recognizing text'){
-          const pct = Math.round((m.progress||0)*100);
-          document.getElementById('aiTxt').textContent = `OCR 인식 중... ${pct}%`;
-        }
-      }
+    document.getElementById('aiTxt').textContent = 'Claude AI 분석 중...';
+    const base64 = dataUrl.split(',')[1];
+    const mime   = (file&&file.type)||'image/jpeg';
+    const res = await fetch('https://api.anthropic.com/v1/messages',{
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version':'2023-06-01',
+        'anthropic-dangerous-direct-browser-access':'true'
+      },
+      body: JSON.stringify({
+        model:'claude-haiku-4-5-20251001',
+        max_tokens:600,
+        messages:[{role:'user',content:[
+          {type:'image',source:{type:'base64',media_type:mime,data:base64}},
+          {type:'text',text:'명함 이미지에서 정보를 추출해서 아래 JSON 형식으로만 답해줘. 값이 없으면 빈 문자열로.\n{"company":"","company_conf":"high","name":"","name_conf":"high","title":"","title_conf":"mid","email":"","email_conf":"high","phone":"","phone_conf":"mid","mobile":"","mobile_conf":"mid"}'}
+        ]}]
+      })
     });
-    const { data: { text } } = await worker.recognize(dataUrl);
-    await worker.terminate();
-
-    const ex = parseCard(text);
+    const data = await res.json();
+    if(data.error){ throw new Error(data.error.message); }
+    const txt = data.content?.[0]?.text||'{}';
+    let ex={};
+    try{ const m=txt.match(/\{[\s\S]*\}/); if(m) ex=JSON.parse(m[0]); }catch(e){}
     S.aiData=ex; S.aiDone=true;
     showAiBar('done');
     if(document.getElementById('screen-verify').classList.contains('on')) fillForm(ex);
-    showToast('✨ OCR 추출 완료');
+    showToast('✨ AI 추출 완료');
   }catch(err){
-    console.error('[OCR]', err);
+    console.error('[AI]',err);
     S.aiDone=true; S.aiData={};
     showAiBar('fail');
-    showToast('⚠️ OCR 실패 — 직접 입력해 주세요');
+    showToast('⚠️ AI 실패: '+err.message);
   }
-}
-
-// ── 명함 텍스트 파싱 ─────────────────────────────────────
-function parseCard(raw){
-  const lines = raw.split('\n').map(l=>l.trim()).filter(l=>l.length>1);
-  const text  = lines.join(' ');
-
-  // 이메일
-  const emailM = text.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
-  const email  = emailM ? emailM[0].toLowerCase() : '';
-
-  // 전화번호 (숫자+구분자 8자리 이상)
-  const telAll = [...text.matchAll(/(\+?[\d][\d\s\-\.\(\)]{6,}[\d])/g)]
-    .map(m=>m[0].replace(/\s/g,'').trim())
-    .filter(p=>p.replace(/\D/g,'').length>=7);
-  const phone  = telAll[0]||'';
-  const mobile = telAll[1]||'';
-
-  // 회사명 — (주), Co., Ltd, Inc 포함 줄 우선
-  let company='';
-  const coRe = /주식회사|㈜|\(주\)|co[,.]?\s*ltd|inc\.?|corp\.?|llc|gmbh|co\.\s/i;
-  for(const l of lines){ if(coRe.test(l)&&l.length<60){ company=l.replace(/^[\s\W]+/,''); break; } }
-  // 없으면 가장 긴 줄(이메일·전화 제외)
-  if(!company){
-    const cand = lines
-      .filter(l=>!l.includes('@')&&!/^[\d\s\-\+\(\)]+$/.test(l)&&l.length>2&&l.length<60)
-      .sort((a,b)=>b.length-a.length);
-    company = cand[0]||'';
-  }
-
-  // 이름 — 한글 2-4자 한 줄, 또는 영문 이름(대문자 시작 단어 2개)
-  let name='';
-  for(const l of lines){
-    if(/^[가-힣]{2,4}$/.test(l)){ name=l; break; }
-  }
-  if(!name){
-    for(const l of lines){
-      if(/^[A-Z][a-z]+ [A-Z][a-z]+$/.test(l)){ name=l; break; }
-    }
-  }
-
-  // 직함 — 직책 키워드 포함 줄
-  const ttlKw = ['대표','이사','부장','과장','팀장','차장','사원','주임','매니저','선임','책임',
-                 'CEO','CFO','CTO','COO','Director','Manager','President','VP','Senior','Engineer'];
-  let title='';
-  for(const l of lines){
-    if(ttlKw.some(k=>l.includes(k))){ title=l; break; }
-  }
-
-  const conf = v => v?'mid':'low';
-  return {
-    company, company_conf: company?'mid':'low',
-    name,    name_conf:    conf(name),
-    title,   title_conf:   conf(title),
-    email,   email_conf:   email?'high':'low',
-    phone,   phone_conf:   conf(phone),
-    mobile,  mobile_conf:  conf(mobile),
-  };
 }
 
 function showAiBar(state){
@@ -1220,6 +1207,30 @@ function applyModal(){
   S.date=document.getElementById('mDate').value; S.sales=document.getElementById('mSales').value;
   localStorage.setItem('bl5_expo',S.expo); localStorage.setItem('bl5_date',S.date); localStorage.setItem('bl5_sales',S.sales);
   document.getElementById('expoModal').classList.remove('on'); showToast('✅ '+S.expo);
+}
+function saveApiKey(){
+  const val = document.getElementById('apiKeyInp').value.trim();
+  if(!val){ showToast('API 키를 입력해주세요'); return; }
+  if(!val.startsWith('sk-ant-')){ showToast('⚠️ 올바른 API 키 형식이 아닙니다 (sk-ant-로 시작해야 해요)'); return; }
+  localStorage.setItem('bl5_apiKey', val);
+  updateApiStatus();
+  showToast('✅ API 키 저장 완료!');
+}
+function previewApiKey(){
+  const v = document.getElementById('apiKeyInp').value.trim();
+  const chip = document.getElementById('apiChip');
+  if(v.startsWith('sk-ant-') && v.length > 20){
+    chip.textContent='입력됨'; chip.className='gs-status-chip on';
+  } else {
+    chip.textContent='미입력'; chip.className='gs-status-chip off';
+  }
+}
+function updateApiStatus(){
+  const key = localStorage.getItem('bl5_apiKey')||'';
+  const chip = document.getElementById('apiChip');
+  const inp  = document.getElementById('apiKeyInp');
+  if(key){ chip.textContent='연결됨'; chip.className='gs-status-chip on'; inp.placeholder='저장됨 (변경하려면 새 키 입력)'; }
+  else   { chip.textContent='미입력'; chip.className='gs-status-chip off'; }
 }
 function saveSet(k,v){ if(k==='sales'){S.sales=v;localStorage.setItem('bl5_sales',v);} }
 function clearAll(){ if(!confirm('로컬 데이터를 전체 삭제할까요? (구글 시트 데이터는 유지됩니다)')) return; S.cards=[]; S.queue=[]; localStorage.removeItem('bl5_cards'); localStorage.removeItem('bl5_queue'); renderList(); showToast('🗑️ 삭제됨'); }
